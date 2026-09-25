@@ -19,21 +19,26 @@
  * @param {Array<{name:string, unlimited:boolean}>} locations
  * @param {Array<{name:string, location:string}>}   props
  * @param {Array<{number:number, note:string, transfers:Array<{prop:string, from:string, to:string}>}>} cues 已按提示号升序
- * @returns {{results: Array, finalState: Object<string,string>, finalLocations: Object<string,string[]>}}
+ * @param {Object} [initial] 可选起始状态（用于「现场偏差推演」从断点接续重放，普通全量重放不传）
+ * @param {Object<string,string>} [initial.state]     道具 -> 起始区位；缺省道具回退到初始区位
+ * @param {Object<string,(number|null)>} [initial.lastMoved] 道具 -> 此前最后一次成功转移的提示号
+ * @returns {{results: Array, finalState: Object<string,string>, finalLocations: Object<string,string[]>, finalLastMoved: Object<string,(number|null)>}}
  *   results 元素：{number, note, ok, errors, transfers,
  *     trace: {sourceMismatches: Array<{prop, from, current, lastMovedCue}>,
  *             capacityConflicts: Array<{location, occupants: Array<{prop, movedIn, lastMovedCue}>}>}}
  */
-function replay(locations, props, cues) {
+function replay(locations, props, cues, initial = {}) {
   const locDef = new Map(locations.map((l) => [l.name, l]));
 
-  // 当前状态：道具 -> 区位（从初始区位开始）
+  // 当前状态：道具 -> 区位（默认从初始区位开始；推演时可从断点的现场状态接续）
   const state = {};
   for (const p of props) state[p.name] = p.location;
+  if (initial.state) Object.assign(state, initial.state);
 
   // 溯源：道具 -> 最后一次成功转移它的提示号（null = 从未成功转移，现处初始区位）
   const lastMoved = {};
   for (const p of props) lastMoved[p.name] = null;
+  if (initial.lastMoved) Object.assign(lastMoved, initial.lastMoved);
 
   const results = [];
 
@@ -120,7 +125,7 @@ function replay(locations, props, cues) {
     finalLocations[loc].push(prop);
   }
 
-  return { results, finalState: state, finalLocations };
+  return { results, finalState: state, finalLocations, finalLastMoved: { ...lastMoved } };
 }
 
 /**

@@ -226,6 +226,29 @@ button:disabled { opacity: .55; cursor: wait; }
 .shift-list li.shift-hit { background: rgba(224, 92, 106, .10); }
 .shift-list li .badge { margin-left: auto; font-size: 12px; padding: 1px 8px; border-radius: 999px; }
 
+/* 现场偏差推演 */
+.sim-entries {
+  margin-top: 14px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 12px 14px;
+  background: rgba(143, 111, 216, .04);
+}
+.sim-entries h3 { margin-top: 0; }
+.sim-planned { color: var(--muted); }
+.sim-plan-loc { color: var(--muted); }
+.sim-diffs li { padding: 3px 0; }
+.sim-boards {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+  margin-top: 8px;
+}
+.sim-boards h4 { margin-top: 12px; }
+@media (max-width: 900px) {
+  .sim-boards { grid-template-columns: 1fr; }
+}
+
 #toast {
   position: fixed;
   bottom: 24px;

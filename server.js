@@ -203,6 +203,118 @@ app.post('/api/cues/preview', (req, res) => {
   });
 });
 
+/* ---------- 现场偏差推演（不写库） ----------
+ * 舞台监督选择一个已执行完的提示号作为断点，录入部分道具的现场区位；未填写者沿用
+ * 该断点的计划区位。先按现有规则重放至断点（含断点），校验现场区位存在且普通区位
+ * 不重叠；再以校正后的现场状态接续重放后续提示，失败组仍整组不生效。
+ * 全程只在内存中进行，不修改提示、道具初始区位或数据库。
+ */
+app.post('/api/cues/simulate', (req, res) => {
+  const { locations, props, cues } = loadBaseData();
+
+  const breakpoint = Number(req.body.breakpoint);
+  if (!Number.isInteger(breakpoint)) return bad(res, '请选择断点提示号（已执行完的提示）');
+  if (!cues.some((c) => c.number === breakpoint))
+    return bad(res, `提示号 ${breakpoint} 不存在，无法作为断点`, 404);
+
+  // 解析现场区位录入：未填写（空值）者沿用断点计划区位
+  const entries = Array.isArray(req.body.entries) ? req.body.entries : [];
+  const locNames = new Set(locations.map((l) => l.name));
+  const propNames = new Set(props.map((p) => p.name));
+  const liveOverrides = {};
+  for (const e of entries) {
+    if (!e || typeof e !== 'object') return bad(res, '现场区位录入格式不正确');
+    const prop = String(e.prop || '').trim();
+    const rawLoc = e.location === undefined || e.location === null ? '' : e.location;
+    const loc = String(rawLoc).trim();
+    if (!prop) continue;
+    if (!propNames.has(prop)) return bad(res, `道具「${prop}」不存在`);
+    if (!loc) continue; // 未填写 → 沿用该断点的计划区位
+    if (!locNames.has(loc)) return bad(res, `道具「${prop}」的现场区位「${loc}」不存在`);
+    liveOverrides[prop] = loc;
+  }
+
+  // 1) 先按现有规则重放至断点（含断点），得到断点处的计划状态与溯源
+  const prefix = cues.filter((c) => c.number <= breakpoint);
+  const suffix = cues.filter((c) => c.number > breakpoint);
+  const prefixReplay = replay(locations, props, prefix);
+  const plannedStateAtBreakpoint = prefixReplay.finalState;
+
+  // 未填写者沿用计划区位，填写者以现场区位校正
+  const liveState = { ...plannedStateAtBreakpoint, ...liveOverrides };
+
+  // 2) 校验现场状态：普通区位（非后台）不得被多件道具占用
+  const occupancy = new Map();
+  for (const [prop, loc] of Object.entries(liveState)) {
+    if (!occupancy.has(loc)) occupancy.set(loc, []);
+    occupancy.get(loc).push(prop);
+  }
+  const overlapErrors = [];
+  for (const [loc, occupants] of occupancy) {
+    const def = locations.find((l) => l.name === loc);
+    if (!def) {
+      overlapErrors.push(`现场区位「${loc}」不存在`);
+    } else if (!def.unlimited && occupants.length > 1) {
+      overlapErrors.push(
+        `现场区位「${loc}」容量为一件，被 ${occupants.map((p) => `「${p}」`).join('、')} 同时占用`
+      );
+    }
+  }
+  if (overlapErrors.length) return bad(res, overlapErrors.join('；'), 409);
+
+  // 3) 原计划：从初始区位全量重放；现场推演：以校正后的断点状态接续重放后续提示
+  const plannedAll = replay(locations, props, cues);
+  const liveSuffix = replay(locations, props, suffix, {
+    state: liveState,
+    lastMoved: prefixReplay.finalLastMoved,
+  });
+
+  // 断点处计划 / 现场差异（只列发生变化的道具）
+  const breakpointDiffs = props
+    .map((p) => ({
+      prop: p.name,
+      planned: plannedStateAtBreakpoint[p.name],
+      live: liveState[p.name],
+    }))
+    .filter((d) => d.planned !== d.live);
+
+  // 后续各提示在原计划与现场推演中的生效状态与冲突原因
+  const plannedBy = new Map(plannedAll.results.map((r) => [r.number, r]));
+  const liveBy = new Map(liveSuffix.results.map((r) => [r.number, r]));
+  const afterCues = suffix.map((c) => {
+    const p = plannedBy.get(c.number) || null;
+    const l = liveBy.get(c.number) || null;
+    return {
+      number: c.number,
+      note: c.note,
+      transfers: c.transfers,
+      planned: p ? { ok: p.ok, errors: p.errors, trace: p.trace } : null,
+      live: l ? { ok: l.ok, errors: l.errors, trace: l.trace } : null,
+      changed: !p || !l || p.ok !== l.ok,
+    };
+  });
+
+  // 最终道具区位差异：原计划最终 vs 现场推演最终
+  const finalDiffs = props
+    .map((p) => ({
+      prop: p.name,
+      planned: plannedAll.finalState[p.name],
+      live: liveSuffix.finalState[p.name],
+    }))
+    .filter((d) => d.planned !== d.live);
+
+  res.json({
+    breakpoint,
+    plannedStateAtBreakpoint,
+    liveState,
+    breakpointDiffs,
+    afterCues,
+    finalDiffs,
+    plannedFinal: { finalState: plannedAll.finalState, finalLocations: plannedAll.finalLocations },
+    liveFinal: { finalState: liveSuffix.finalState, finalLocations: liveSuffix.finalLocations },
+  });
+});
+
 app.put('/api/cues/:number', (req, res) => {
   const number = Number(req.params.number);
   if (!db.prepare('SELECT 1 FROM cues WHERE number = ?').get(number))

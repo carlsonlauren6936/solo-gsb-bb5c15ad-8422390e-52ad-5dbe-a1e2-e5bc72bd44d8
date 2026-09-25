@@ -90,6 +90,24 @@
         <div id="final-board" class="board"></div>
       </div>
     </section>
+
+    <!-- 四、现场偏差推演 -->
+    <section class="row">
+      <div class="card wide">
+        <h2>⑥ 现场偏差推演（不写库）</h2>
+        <p class="hint">舞台监督选择一个<strong>已执行完的提示号</strong>作为断点，录入部分道具的现场区位；未填写者沿用该断点的计划区位。先按现有规则重放至断点并校验现场区位（普通区位不得重叠），再以校正后的现场状态接续重放后续提示，失败组仍整组不生效。推演仅在内存中进行，不修改提示、道具初始区位或数据库。</p>
+        <form id="sim-form" class="inline-form">
+          <label>断点提示号
+            <select id="sim-breakpoint" required>
+              <option value="">请选择已执行完的提示…</option>
+            </select>
+          </label>
+          <button type="button" id="sim-run" class="ghost">🔀 开始现场推演</button>
+        </form>
+        <div id="sim-entries" class="sim-entries hidden"></div>
+        <div id="sim-panel" class="preview-panel hidden"></div>
+      </div>
+    </section>
   </main>
 
   <div id="toast" class="hidden"></div>
