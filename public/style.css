@@ -226,6 +226,14 @@ button:disabled { opacity: .55; cursor: wait; }
 .shift-list li.shift-hit { background: rgba(224, 92, 106, .10); }
 .shift-list li .badge { margin-left: auto; font-size: 12px; padding: 1px 8px; border-radius: 999px; }
 
+/* 现场偏差推演 */
+.sim-table td .empty { color: var(--muted); font-size: 13px; }
+.sim-diff-table th, .sim-diff-table td { border-bottom: 1px solid var(--line); }
+.sim-diff-table tr.sim-diff-row td { background: rgba(224, 164, 88, .08); }
+.sim-diff-table tr.sim-diff-row td:first-child { border-radius: 6px 0 0 6px; }
+.sim-diff-table tr.sim-diff-row td:last-child { border-radius: 0 6px 6px 0; }
+.pv-cue-head .note { color: var(--muted); font-size: 13px; }
+
 #toast {
   position: fixed;
   bottom: 24px;

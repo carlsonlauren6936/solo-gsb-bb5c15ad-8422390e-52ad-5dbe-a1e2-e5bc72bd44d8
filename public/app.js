@@ -56,9 +56,11 @@ function propOptions(selected) {
 /* ---------- 冲突溯源（失败提示旁展示，lastMovedCue 为 null 表示初始区位） ---------- */
 
 function lastMovedText(cueNumber) {
-  return cueNumber === null || cueNumber === undefined
-    ? '初始区位（从未成功转移）'
-    : `提示 ${cueNumber}`;
+  if (cueNumber === null || cueNumber === undefined)
+    return '初始区位（从未成功转移）';
+  if (cueNumber === 'onsite')
+    return '现场校正（断点处现场录入）';
+  return `提示 ${cueNumber}`;
 }
 
 function traceHtml(trace) {
@@ -216,6 +218,7 @@ function render() {
   renderCueForm();
   renderCues();
   renderReplay();
+  renderSimForm();
 }
 
 /* ---------- 事件 ---------- */
@@ -495,6 +498,219 @@ $('#shift-form').addEventListener('submit', async (e) => {
     toast('平移完成，已按新号全量重放', true);
   } catch (err) {
     renderShiftError('无法连接服务器');
+  }
+});
+
+/* ---------- 现场偏差推演（不写库） ---------- */
+
+let simBreakpoint = '';      // 选中的断点提示号
+let simOverrides = {};       // 道具 -> 现场区位（'' 或缺失 = 沿用计划）
+let simResult = null;        // 最近一次成功推演的结果，全局状态一变即失效
+
+function clearSimResult() {
+  simResult = null;
+  const panel = $('#sim-panel');
+  panel.classList.add('hidden');
+  panel.innerHTML = '';
+}
+
+function renderSimForm(keepResult) {
+  if (!keepResult) clearSimResult();
+
+  // 道具被删除后，清理残留的现场录入
+  for (const prop of Object.keys(simOverrides)) {
+    if (!state.props.some((p) => p.name === prop)) delete simOverrides[prop];
+  }
+
+  // 断点下拉：复用重放结果标注该提示在计划序列中的生效情况
+  const sel = $('#sim-breakpoint');
+  const resultByNumber = new Map(state.replay.results.map((r) => [r.number, r]));
+  const opts = ['<option value="">请选择断点提示号…</option>']
+    .concat(state.cues.map((c) => {
+      const r = resultByNumber.get(c.number);
+      const label = r
+        ? `${c.number}（${r.ok ? '已生效' : '未生效'}）${c.note ? ' · ' + c.note : ''}`
+        : `${c.number}`;
+      return `<option value="${c.number}" ${String(c.number) === String(simBreakpoint) ? 'selected' : ''}>${esc(label)}</option>`;
+    }));
+  sel.innerHTML = opts.join('');
+  if (!state.cues.some((c) => String(c.number) === String(simBreakpoint)))
+    simBreakpoint = '';
+  sel.value = simBreakpoint;
+
+  // 道具行：断点处计划区位（推演成功后才有值）+ 现场区位录入
+  const planState = simResult ? simResult.planStateAtBreakpoint : null;
+  $('#sim-rows').innerHTML = state.props
+    .map((p) => {
+      const planLoc = planState ? planState[p.name] : null;
+      const val = Object.prototype.hasOwnProperty.call(simOverrides, p.name)
+        ? simOverrides[p.name]
+        : '';
+      return `
+        <tr data-sim-prop="${esc(p.name)}">
+          <td>${esc(p.name)}</td>
+          <td class="sim-plan-loc">${planLoc !== null ? esc(planLoc) : '<span class="empty">—</span>'}</td>
+          <td>
+            <select class="sim-loc">
+              <option value="" ${val === '' ? 'selected' : ''}>沿用计划</option>
+              ${locationOptions(val === '' ? null : val)}
+            </select>
+          </td>
+        </tr>`;
+    })
+    .join('');
+}
+
+function simStatusHtml(side) {
+  if (!side) return '<span class="pv-none">（序列中不存在）</span>';
+  if (side.ok) return '<span class="badge ok">✓ 生效</span>';
+  return `<span class="badge fail">✗ 整组未生效</span>
+    <ul class="cue-errors">${side.errors.map((e) => `<li>${esc(e)}</li>`).join('') || '<li>（无冲突原因）</li>'}</ul>
+    ${traceHtml(side.trace)}`;
+}
+
+function renderSimPanel(data) {
+  const panel = $('#sim-panel');
+
+  // 一、断点处计划 / 现场差异
+  const breakRows = data.breakpointDiff.length
+    ? data.breakpointDiff
+        .map((d) => `
+          <tr class="sim-diff-row">
+            <td>${esc(d.prop)}${d.recorded ? ' <span class="trace-tag">现场录入</span>' : ''}</td>
+            <td>${esc(d.plan)}</td>
+            <td><span class="arrow">→</span></td>
+            <td>${esc(d.onsite)}</td>
+          </tr>`)
+        .join('')
+    : '<tr><td colspan="4" class="hint" style="border:none">所有道具均沿用断点处计划区位，无差异。</td></tr>';
+
+  // 二、后续各提示：原计划 vs 现场推演
+  const cueBlocks = data.followCues.length
+    ? data.followCues.map((c) => {
+        const flip = c.changed
+          ? c.onsite.ok
+            ? '<span class="pv-flip up">未生效 → 生效 ↑</span>'
+            : '<span class="pv-flip down">生效 → 未生效 ↓</span>'
+          : '<span class="pv-tag">生效状态不变</span>';
+        return `
+          <div class="pv-cue">
+            <div class="pv-cue-head"><span class="num">提示 ${c.number}</span><span class="note">${esc(c.note || '')}</span>${flip}</div>
+            <div class="pv-sides">
+              <div class="pv-side"><div class="pv-side-label">原计划</div>${simStatusHtml(c.plan)}</div>
+              <div class="pv-arrow">→</div>
+              <div class="pv-side"><div class="pv-side-label">现场推演</div>${simStatusHtml(c.onsite)}</div>
+            </div>
+          </div>`;
+      }).join('')
+    : '<p class="hint">断点之后没有后续提示。</p>';
+
+  // 三、最终道具区位差异
+  const finalBlocks = data.finalDiff.length
+    ? `<ul class="pv-moved">${data.finalDiff
+        .map((d) => `<li>「${esc(d.prop)}」：${esc(d.plan)} <span class="arrow">→</span> ${esc(d.onsite)}${d.fromBreakpoint ? '<span class="trace-tag dim">停留在断点现场区位</span>' : ''}</li>`)
+        .join('')}</ul>`
+    : '<p class="hint">推演结束后，所有道具的最终区位与原计划一致。</p>';
+
+  panel.innerHTML = `
+    <div class="pv-title">🎯 现场偏差推演 · 断点为提示 ${data.breakpoint}（${esc(data.note || '无备注')}）—— 仅内存重放，未写入数据库</div>
+    <h4>一、断点处计划 / 现场区位差异（另有 ${data.unchangedAtBreakpoint} 件道具无差异、沿用计划）</h4>
+    <table class="table sim-diff-table">
+      <thead><tr><th>道具</th><th>计划区位</th><th></th><th>现场区位</th></tr></thead>
+      <tbody>${breakRows}</tbody>
+    </table>
+    <h4>二、断点之后各提示的生效状态（原计划 → 现场推演，失败组仍整组不生效）</h4>
+    ${cueBlocks}
+    <h4>三、推演结束后的最终道具区位差异（原计划 → 现场推演）</h4>
+    ${finalBlocks}`;
+  panel.classList.remove('hidden');
+}
+
+function renderSimError(msg, data) {
+  const panel = $('#sim-panel');
+  const conflicts = data && data.validation && data.validation.conflicts
+    ? `<ul class="cue-errors">${data.validation.conflicts.map((e) => `<li>${esc(e)}</li>`).join('')}</ul>`
+    : '';
+
+  // 现场区位不合法时，仍把已解析出的计划/现场区位并列展示，便于对照修改
+  let breakTable = '';
+  if (data && data.planState && data.onsiteState) {
+    const rows = state.props
+      .map((p) => {
+        const plan = data.planState[p.name];
+        const onsite = data.onsiteState[p.name];
+        const diff = plan !== onsite;
+        return `
+          <tr class="${diff ? 'sim-diff-row' : ''}">
+            <td>${esc(p.name)}</td>
+            <td>${esc(plan)}</td>
+            <td><span class="arrow">→</span></td>
+            <td>${esc(onsite)}</td>
+          </tr>`;
+      })
+      .join('');
+    breakTable = `
+      <h4>断点处计划 / 现场区位对照</h4>
+      <table class="table sim-diff-table">
+        <thead><tr><th>道具</th><th>计划区位</th><th></th><th>现场区位</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>`;
+  }
+
+  panel.innerHTML = `
+    <div class="pv-title">🎯 现场偏差推演 · 断点 ${data && data.breakpoint ? data.breakpoint : ''}</div>
+    <div class="pv-error">${esc(msg)}</div>
+    ${conflicts}
+    ${breakTable}`;
+  panel.classList.remove('hidden');
+}
+
+// 记录现场区位录入；录入一变，旧推演即失效
+$('#sim-rows').addEventListener('change', (e) => {
+  const row = e.target.closest('tr[data-sim-prop]');
+  if (!row || !e.target.classList.contains('sim-loc')) return;
+  simOverrides[row.dataset.simProp] = e.target.value;
+  clearSimResult();
+});
+
+// 切换断点：计划区位列与旧推演都失效，保留已录入的现场区位
+$('#sim-breakpoint').addEventListener('change', (e) => {
+  simBreakpoint = e.target.value;
+  renderSimForm();
+});
+
+$('#sim-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  if (!simBreakpoint) {
+    renderSimError('请先选择一个已执行完的提示号作为断点');
+    return;
+  }
+  const overrides = Object.entries(simOverrides)
+    .filter(([, loc]) => loc !== '')
+    .map(([prop, location]) => ({ prop, location }));
+
+  const btn = $('#sim-run');
+  btn.disabled = true;
+  btn.textContent = '推演中…';
+  try {
+    const res = await fetch('/api/onsite/simulate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ breakpoint: Number(simBreakpoint), overrides }),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      renderSimError(data.error || '推演无法进行', data);
+    } else {
+      simResult = data;
+      renderSimForm(true);
+      renderSimPanel(data);
+    }
+  } catch (err) {
+    renderSimError('无法连接服务器');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '🎯 开始现场推演';
   }
 });
 

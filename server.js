@@ -2,7 +2,13 @@
 
 const express = require('express');
 const db = require('./db');
-const { replay, diffReplays } = require('./replay');
+const {
+  replay,
+  replayFrom,
+  occupancyConflicts,
+  ONSITE_MARK,
+  diffReplays,
+} = require('./replay');
 
 const app = express();
 app.use(express.json());
@@ -315,6 +321,155 @@ app.post('/api/cues/shift', (req, res) => {
   });
   tx();
   ok(res);
+});
+
+/* ---------- 现场偏差推演（不写库） ----------
+ * 舞台监督选择一条「已执行完」的提示号作为断点，录入部分道具的现场区位
+ * （未录入者沿用该断点的计划区位）。先按现有规则重放至断点得到计划状态，
+ * 校验现场区位合法（区位存在且普通区位不重叠），再以校正后的现场状态
+ * 接续重放断点之后的提示；失败组仍按同一规则整组不生效。
+ * 整个过程只在内存中重放，不修改提示、道具初始区位或数据库。
+ */
+
+function badSim(res, msg, extra = {}) {
+  res.status(400).json({ error: msg, ...extra });
+}
+
+app.post('/api/onsite/simulate', (req, res) => {
+  const breakpoint = Number(req.body.breakpoint);
+  if (!Number.isSafeInteger(breakpoint) || breakpoint <= 0)
+    return badSim(res, '断点提示号必须是正整数');
+
+  const { locations, props, cues } = loadBaseData();
+  const cue = cues.find((c) => c.number === breakpoint);
+  if (!cue) return badSim(res, `提示号 ${breakpoint} 不存在，无法作为断点`);
+
+  const propNames = new Set(props.map((p) => p.name));
+  const locNames = new Set(locations.map((l) => l.name));
+
+  // 解析现场录入：支持 [{prop, location}] 或 {prop: location}，空字符串/缺省 = 沿用计划
+  let raw = req.body.overrides;
+  if (!Array.isArray(raw) && raw && typeof raw === 'object') {
+    raw = Object.entries(raw).map(([prop, location]) => ({ prop, location }));
+  }
+  if (!Array.isArray(raw)) return badSim(res, '现场区位录入格式不正确');
+
+  const overrides = {};
+  for (const item of raw) {
+    if (!item || typeof item !== 'object') return badSim(res, '现场区位录入格式不正确');
+    const prop = String(item.prop || '').trim();
+    const location = item.location === undefined || item.location === null
+      ? ''
+      : String(item.location).trim();
+    if (!prop) return badSim(res, '现场区位录入缺少道具名称');
+    if (!propNames.has(prop)) return badSim(res, `道具「${prop}」不存在`);
+    if (location !== '' && !locNames.has(location))
+      return badSim(res, `现场区位「${location}」不存在`);
+    if (Object.prototype.hasOwnProperty.call(overrides, prop))
+      return badSim(res, `道具「${prop}」的现场区位被重复录入`);
+    overrides[prop] = location;
+  }
+
+  // 1) 按现有规则重放至断点（含断点提示本身），得到断点处的计划状态
+  const idx = cues.findIndex((c) => c.number === breakpoint);
+  const prefix = cues.slice(0, idx + 1);
+  const suffix = cues.slice(idx + 1);
+
+  const planPrefix = replay(locations, props, prefix);
+  const planStateAtBreakpoint = planPrefix.finalState;
+
+  // 2) 校正为现场状态：未录入者沿用该断点的计划区位
+  const onsiteState = { ...planStateAtBreakpoint };
+  const onsiteLastMoved = { ...planPrefix.lastMoved };
+  const recorded = {};
+  for (const [prop, location] of Object.entries(overrides)) {
+    if (location !== '') {
+      onsiteState[prop] = location;
+      onsiteLastMoved[prop] = ONSITE_MARK; // 溯源：该道具由现场校正
+      recorded[prop] = location;
+    }
+  }
+
+  // 3) 校验现场状态：区位存在且普通区位不重叠（与整组容量规则一致）
+  const conflicts = occupancyConflicts(locations, onsiteState);
+  if (conflicts.length) {
+    return badSim(res, '断点处现场区位不合法，无法接续推演', {
+      breakpoint,
+      planState: planStateAtBreakpoint,
+      onsiteState,
+      recorded,
+      validation: {
+        ok: false,
+        conflicts: conflicts.map((c) =>
+          c.missing
+            ? `区位「${c.location}」不存在，却被 ${c.occupants.map((p) => `「${p}」`).join('、')} 占用`
+            : `普通区位「${c.location}」容量为一件，现场状态下被 ${c.occupants.map((p) => `「${p}」`).join('、')} 同时占用`
+        ),
+        conflictsDetail: conflicts,
+      },
+    });
+  }
+
+  // 4) 以校正后的现场状态接续重放后续提示（复用同一重放规则，失败组整组不生效）
+  const onsiteReplay = replayFrom(locations, suffix, onsiteState, onsiteLastMoved);
+
+  // 5) 原计划侧：同样的全序列重放，用于并列对比
+  const planReplay = replay(locations, props, cues);
+
+  // 断点处计划/现场差异（仅列出区位不同的道具）
+  const breakpointDiff = props
+    .map((p) => ({
+      prop: p.name,
+      plan: planStateAtBreakpoint[p.name],
+      onsite: onsiteState[p.name],
+      recorded: Object.prototype.hasOwnProperty.call(recorded, p.name),
+    }))
+    .filter((d) => d.plan !== d.onsite);
+
+  // 后续各提示：原计划 vs 现场推演的生效状态与冲突原因
+  const planBy = new Map(planReplay.results.map((r) => [r.number, r]));
+  const onsiteBy = new Map(onsiteReplay.results.map((r) => [r.number, r]));
+  const followCues = suffix.map((c) => {
+    const p = planBy.get(c.number) || null;
+    const o = onsiteBy.get(c.number) || null;
+    return {
+      number: c.number,
+      note: c.note,
+      changed: !p || !o ? false : p.ok !== o.ok,
+      plan: p ? { ok: p.ok, errors: p.errors, trace: p.trace } : null,
+      onsite: o ? { ok: o.ok, errors: o.errors, trace: o.trace } : null,
+    };
+  });
+
+  // 最终道具区位差异（计划终态 vs 现场推演终态）
+  const finalDiff = [];
+  for (const p of props) {
+    const planLoc = planReplay.finalState[p.name];
+    const onsiteLoc = onsiteReplay.finalState[p.name];
+    if (planLoc !== onsiteLoc) {
+      finalDiff.push({
+        prop: p.name,
+        plan: planLoc,
+        onsite: onsiteLoc,
+        // 现场终态停留在断点现场区位 = 后续没有任何提示成功移动它
+        fromBreakpoint: onsiteLoc === onsiteState[p.name],
+      });
+    }
+  }
+
+  res.json({
+    breakpoint,
+    note: cue.note,
+    recorded,
+    planStateAtBreakpoint,
+    onsiteStateAtBreakpoint: onsiteState,
+    breakpointDiff,
+    unchangedAtBreakpoint: props.length - breakpointDiff.length,
+    followCues,
+    plan: planReplay,
+    onsite: onsiteReplay,
+    finalDiff,
+  });
 });
 
 /* ---------- 启动 ---------- */

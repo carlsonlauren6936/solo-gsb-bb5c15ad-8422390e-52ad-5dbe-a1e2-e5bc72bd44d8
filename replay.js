@@ -1,7 +1,7 @@
 'use strict';
 
 /**
- * 全量重放：从道具初始区位出发，按提示号升序逐组校验并应用转移。
+ * 逐组校验并应用提示（重放规则的唯一实现，全量重放与现场偏差推演共用）。
  *
  * 规则：
  *  - 每组转移基于「该组变动前」的状态校验来源区位；
@@ -12,29 +12,17 @@
  * 冲突溯源（trace，随每组结果返回）：
  *  - 维护「道具 -> 最后一次成功转移它的提示号」，仅在某组整组生效后按提示号顺序更新，
  *    失败组既不改变位置也不改变溯源；null 表示从未成功转移（现处初始区位）；
+ *    特殊值 ONSITE_MARK 表示断点处由舞台监督现场校正录入；
  *  - 来源区位不符：记录道具当前区位与最后一次成功转移的提示号；
  *  - 容量冲突：记录试算后同占该区位的全部道具，标明是否由本组转入，
  *    以及各道具此前（组前状态）最后一次成功转移的提示号。
  *
- * @param {Array<{name:string, unlimited:boolean}>} locations
- * @param {Array<{name:string, location:string}>}   props
- * @param {Array<{number:number, note:string, transfers:Array<{prop:string, from:string, to:string}>}>} cues 已按提示号升序
- * @returns {{results: Array, finalState: Object<string,string>, finalLocations: Object<string,string[]>}}
- *   results 元素：{number, note, ok, errors, transfers,
- *     trace: {sourceMismatches: Array<{prop, from, current, lastMovedCue}>,
- *             capacityConflicts: Array<{location, occupants: Array<{prop, movedIn, lastMovedCue}>}>}}
+ * 注意：会就地修改传入的 state / lastMoved，需要保留原状态时调用方应先拷贝。
+ *
+ * @returns {{results: Array, state: Object<string,string>, lastMoved: Object<string,*>}}
  */
-function replay(locations, props, cues) {
+function runCues(locations, cues, state, lastMoved) {
   const locDef = new Map(locations.map((l) => [l.name, l]));
-
-  // 当前状态：道具 -> 区位（从初始区位开始）
-  const state = {};
-  for (const p of props) state[p.name] = p.location;
-
-  // 溯源：道具 -> 最后一次成功转移它的提示号（null = 从未成功转移，现处初始区位）
-  const lastMoved = {};
-  for (const p of props) lastMoved[p.name] = null;
-
   const results = [];
 
   for (const cue of cues) {
@@ -112,15 +100,101 @@ function replay(locations, props, cues) {
     }
   }
 
-  // 汇总最终区位：区位 -> [道具]
+  return { results, state, lastMoved };
+}
+
+/**
+ * 现场校正后接续重放时，lastMoved 中标记道具区位来自断点现场录入
+ * （而非计划中的某条提示），trace 展示为「现场校正」。
+ */
+const ONSITE_MARK = 'onsite';
+
+/** 汇总最终区位：区位 -> [道具] */
+function buildFinalLocations(locations, state) {
   const finalLocations = {};
   for (const l of locations) finalLocations[l.name] = [];
   for (const [prop, loc] of Object.entries(state)) {
     if (!finalLocations[loc]) finalLocations[loc] = [];
     finalLocations[loc].push(prop);
   }
+  return finalLocations;
+}
 
-  return { results, finalState: state, finalLocations };
+/**
+ * 检查一个状态是否合法：每个区位都存在，且普通（非后台）区位不被多件道具占用。
+ * 供「现场偏差推演」校验断点处的现场状态使用（规则与整组容量校验一致）。
+ *
+ * @returns {Array<{location:string, occupants:string[]}>} 冲突区位列表，为空即合法
+ */
+function occupancyConflicts(locations, state) {
+  const locDef = new Map(locations.map((l) => [l.name, l]));
+  const occupancy = new Map(); // 区位 -> [道具]
+  for (const [prop, loc] of Object.entries(state)) {
+    if (!occupancy.has(loc)) occupancy.set(loc, []);
+    occupancy.get(loc).push(prop);
+  }
+  const conflicts = [];
+  for (const [loc, occupants] of occupancy) {
+    const def = locDef.get(loc);
+    if (!def) {
+      conflicts.push({ location: loc, occupants, missing: true });
+    } else if (!def.unlimited && occupants.length > 1) {
+      conflicts.push({ location: loc, occupants, missing: false });
+    }
+  }
+  return conflicts;
+}
+
+/**
+ * 全量重放：从道具初始区位出发，按提示号升序逐组校验并应用转移。
+ *
+ * @param {Array<{name:string, unlimited:boolean}>} locations
+ * @param {Array<{name:string, location:string}>}   props
+ * @param {Array<{number:number, note:string, transfers:Array<{prop:string, from:string, to:string}>}>} cues 已按提示号升序
+ * @returns {{results: Array, finalState: Object<string,string>,
+ *            finalLocations: Object<string,string[]>, lastMoved: Object<string,*>}}
+ *   results 元素：{number, note, ok, errors, transfers,
+ *     trace: {sourceMismatches: Array<{prop, from, current, lastMovedCue}>,
+ *             capacityConflicts: Array<{location, occupants: Array<{prop, movedIn, lastMovedCue}>}>}}
+ */
+function replay(locations, props, cues) {
+  // 当前状态：道具 -> 区位（从初始区位开始）
+  const state = {};
+  for (const p of props) state[p.name] = p.location;
+
+  // 溯源：道具 -> 最后一次成功转移它的提示号（null = 从未成功转移，现处初始区位）
+  const lastMoved = {};
+  for (const p of props) lastMoved[p.name] = null;
+
+  const run = runCues(locations, cues, state, lastMoved);
+  return {
+    results: run.results,
+    finalState: run.state,
+    finalLocations: buildFinalLocations(locations, run.state),
+    lastMoved: run.lastMoved,
+  };
+}
+
+/**
+ * 从任意给定状态接续重放（现场偏差推演专用）：
+ * 前半段提示重放到断点后，用断点处的现场状态校正，再按同样规则重放后续提示。
+ *
+ * @param {Array} locations 区位定义
+ * @param {Array} restCues  断点之后的提示（已按提示号升序）
+ * @param {Object} startState     断点校正后的现场状态（会被拷贝，不修改入参）
+ * @param {Object} startLastMoved 校正后溯源：现场录入的道具标记为 ONSITE_MARK
+ * @returns {ReturnType<replay>}
+ */
+function replayFrom(locations, restCues, startState, startLastMoved) {
+  const state = { ...startState };
+  const lastMoved = { ...startLastMoved };
+  const run = runCues(locations, restCues, state, lastMoved);
+  return {
+    results: run.results,
+    finalState: run.state,
+    finalLocations: buildFinalLocations(locations, run.state),
+    lastMoved: run.lastMoved,
+  };
 }
 
 /**
@@ -167,4 +241,4 @@ function diffReplays(before, after) {
   return { changedCues, movedProps };
 }
 
-module.exports = { replay, diffReplays };
+module.exports = { replay, replayFrom, runCues, occupancyConflicts, buildFinalLocations, ONSITE_MARK, diffReplays };
